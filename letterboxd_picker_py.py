@@ -451,6 +451,17 @@ HTML = """
       </section>
     {% endif %}
   </main>
+
+<script>
+  const form = document.querySelector("form");
+  const button = document.querySelector("button");
+
+  form.addEventListener("submit", () => {
+    button.textContent = "Picking...";
+    button.disabled = true;
+  });
+</script>
+  
 </body>
 </html>
 """
