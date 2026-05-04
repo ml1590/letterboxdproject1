@@ -1,24 +1,26 @@
-
 #!/usr/bin/env python3
 """
-Letterboxd Watchlist Random Movie Picker
-Scrapes the user's public Letterboxd watchlist, applies optional filters,
-and returns a random movie with full details.
+Letterboxd Watchlist Random Movie Picker - Web App Version
+
+How to run:
+1. Save this file as app.py
+2. Install Flask:
+   pip install flask
+3. Run:
+   python app.py
+4. Open your browser to:
+   http://127.0.0.1:5000
 """
 
-import os, sys, json, random, re, time
-import urllib.request, urllib.error
+import json
+import random
+import re
+import time
+import urllib.request
 from html.parser import HTMLParser
+from flask import Flask, request, render_template_string
 
-# ── Inputs from env ──────────────────────────────────────────────────────────
-USERNAME       = os.environ.get("LB_USERNAME", "").strip().lower()
-GENRE_FILTER   = os.environ.get("LB_GENRE", "").strip().lower()       # e.g. "horror"
-MIN_RATING     = float(os.environ.get("LB_MIN_RATING", "0") or "0")   # 0-5
-RUNTIME_FILTER = os.environ.get("LB_RUNTIME", "any").strip().lower()  # any|short|feature
-
-if not USERNAME:
-    print(json.dumps({"error": "No Letterboxd username provided."}))
-    sys.exit(1)
+app = Flask(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -29,51 +31,52 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+
 def fetch(url, retries=3):
     for i in range(retries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=15) as r:
                 return r.read().decode("utf-8", errors="replace")
-        except Exception as e:
+        except Exception:
             if i == retries - 1:
                 raise
             time.sleep(1.5)
 
-# ── Parse watchlist ───────────────────────────────────────────────────────────
+
 class WatchlistParser(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.movies = []   # list of {"slug": ..., "name": ...}
+        self.movies = []
         self.last_page = 1
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        # Pattern 1: data-film-slug attribute
+
         if tag == "div" and attrs.get("data-film-slug"):
             slug = attrs["data-film-slug"]
             name = attrs.get("data-film-name", slug.replace("-", " ").title())
             if not any(m["slug"] == slug for m in self.movies):
                 self.movies.append({"slug": slug, "name": name})
-        # Pattern 2: data-target-link="/film/{slug}/"
+
         if tag in ("div", "li", "a", "article") and attrs.get("data-target-link", "").startswith("/film/"):
-            m = re.match(r"^/film/([^/]+)/$", attrs["data-target-link"])
-            if m:
-                slug = m.group(1)
+            match = re.match(r"^/film/([^/]+)/$", attrs["data-target-link"])
+            if match:
+                slug = match.group(1)
                 name = attrs.get("data-film-name", slug.replace("-", " ").title())
                 if not any(mv["slug"] == slug for mv in self.movies):
                     self.movies.append({"slug": slug, "name": name})
-        # Detect last page number from pagination
+
         if tag == "a" and attrs.get("href", ""):
-            m = re.search(r"/watchlist/page/(\d+)/$", attrs["href"])
-            if m:
-                p = int(m.group(1))
-                if p > self.last_page:
-                    self.last_page = p
+            match = re.search(r"/watchlist/page/(\d+)/$", attrs["href"])
+            if match:
+                page = int(match.group(1))
+                if page > self.last_page:
+                    self.last_page = page
+
 
 def scrape_watchlist(username):
     base = f"https://letterboxd.com/{username}/watchlist"
-    # First page to discover total pages
     html = fetch(f"{base}/")
     parser = WatchlistParser()
     parser.feed(html)
@@ -90,7 +93,7 @@ def scrape_watchlist(username):
 
     return parser.movies
 
-# ── Parse film detail page ────────────────────────────────────────────────────
+
 class FilmParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -98,22 +101,13 @@ class FilmParser(HTMLParser):
         self._in_script = False
         self._script_type = ""
         self._buf = ""
-        self.genres = []
-        self._in_genre_section = False
-        self.poster_url = ""
 
     def handle_starttag(self, tag, attrs):
         attrs_d = dict(attrs)
-        if tag == "script":
-            if "application/ld+json" in attrs_d.get("type", ""):
-                self._in_script = True
-                self._script_type = "json_ld"
-                self._buf = ""
-        if tag == "a" and "genre" in attrs_d.get("href", ""):
-            self._in_genre_section = True
-        if tag == "img" and attrs_d.get("src", "").startswith("https://a.ltrbxd.com"):
-            if not self.poster_url:
-                self.poster_url = attrs_d["src"]
+        if tag == "script" and "application/ld+json" in attrs_d.get("type", ""):
+            self._in_script = True
+            self._script_type = "json_ld"
+            self._buf = ""
 
     def handle_endtag(self, tag):
         if tag == "script" and self._in_script:
@@ -121,23 +115,17 @@ class FilmParser(HTMLParser):
             if self._script_type == "json_ld":
                 try:
                     raw = self._buf.strip()
-                    # Strip CDATA wrappers: /* <![CDATA[ */ ... /* ]]> */
                     raw = re.sub(r'/\*\s*<!\[CDATA\[\s*\*/', '', raw)
                     raw = re.sub(r'/\*\s*\]\]>\s*\*/', '', raw)
                     self.json_ld = json.loads(raw.strip())
                 except Exception:
                     pass
             self._buf = ""
-        if tag == "a" and self._in_genre_section:
-            self._in_genre_section = False
 
     def handle_data(self, data):
         if self._in_script:
             self._buf += data
-        if self._in_genre_section:
-            t = data.strip()
-            if t and t not in self.genres:
-                self.genres.append(t)
+
 
 def get_film_details(slug):
     url = f"https://letterboxd.com/film/{slug}/"
@@ -146,143 +134,364 @@ def get_film_details(slug):
     parser.feed(html)
 
     details = {
-        "slug": slug, "url": url, "genres": [], "runtime": None,
-        "rating": None, "year": None, "synopsis": "", "poster": "",
-        "director": "", "title": slug.replace("-", " ").title()
+        "slug": slug,
+        "url": url,
+        "genres": [],
+        "runtime": None,
+        "rating": None,
+        "year": "",
+        "synopsis": "No synopsis available.",
+        "poster": "",
+        "director": "",
+        "title": slug.replace("-", " ").title(),
     }
 
-    # Extract from JSON-LD structured data
     if parser.json_ld:
         jl = parser.json_ld
         details["title"] = jl.get("name", details["title"])
-        details["synopsis"] = jl.get("description", "")
+        details["synopsis"] = jl.get("description", details["synopsis"])
         details["rating"] = jl.get("aggregateRating", {}).get("ratingValue")
-        # Year: try datePublished first, then releasedEvent
+
         if jl.get("datePublished"):
             details["year"] = str(jl["datePublished"])[:4]
         elif jl.get("releasedEvent"):
-            ev = jl["releasedEvent"]
-            if isinstance(ev, list) and ev:
-                details["year"] = str(ev[0].get("startDate", ""))[:4]
-            elif isinstance(ev, dict):
-                details["year"] = str(ev.get("startDate", ""))[:4]
+            event = jl["releasedEvent"]
+            if isinstance(event, list) and event:
+                details["year"] = str(event[0].get("startDate", ""))[:4]
+            elif isinstance(event, dict):
+                details["year"] = str(event.get("startDate", ""))[:4]
+
         details["poster"] = jl.get("image", "")
+
         directors = jl.get("director", [])
         if isinstance(directors, list) and directors:
-            details["director"] = ", ".join(d.get("name", "") for d in directors)
+            details["director"] = ", ".join(d.get("name", "") for d in directors if d.get("name"))
         elif isinstance(directors, dict):
             details["director"] = directors.get("name", "")
+
         genres_raw = jl.get("genre", [])
         if isinstance(genres_raw, list):
             details["genres"] = [g.lower() for g in genres_raw]
         elif isinstance(genres_raw, str):
             details["genres"] = [genres_raw.lower()]
 
-    # Runtime — Letterboxd uses "97&nbsp;mins" format
-    rt_match = re.search(r'(\d+)(?:&nbsp;|\s*)mins?', html, re.IGNORECASE)
-    if rt_match:
-        details["runtime"] = int(rt_match.group(1))
+    runtime_match = re.search(r'(\d+)(?:&nbsp;|\s*)mins?', html, re.IGNORECASE)
+    if runtime_match:
+        details["runtime"] = int(runtime_match.group(1))
 
-    # Synopsis fallback: og:description or meta description
     og_desc = re.search(r'<meta property="og:description" content="([^"]+)"', html)
-    if not details["synopsis"] and og_desc:
+    if details["synopsis"] == "No synopsis available." and og_desc:
         details["synopsis"] = og_desc.group(1)
-    if not details["synopsis"]:
-        meta_desc = re.search(r'<meta name="description" content="([^"]+)"', html)
-        if meta_desc:
-            details["synopsis"] = meta_desc.group(1)
 
-    # Poster: prefer og:image (higher resolution)
     og_img = re.search(r'<meta property="og:image" content="([^"]+)"', html)
     if og_img:
         details["poster"] = og_img.group(1)
 
-    # Genre fallback from sidebar links
-    genre_links = re.findall(r'href="/films/genre/([^/"]+)/"', html)
-    if genre_links and not details["genres"]:
-        details["genres"] = list(set(g.replace("-", " ") for g in genre_links))
-
     return details
 
-# ── Filter logic ──────────────────────────────────────────────────────────────
-def passes_filters(details):
-    # Genre filter
-    if GENRE_FILTER and GENRE_FILTER != "any":
+
+def passes_filters(details, genre_filter, min_rating, runtime_filter):
+    if genre_filter and genre_filter != "any":
         movie_genres = [g.lower() for g in details.get("genres", [])]
-        if not any(GENRE_FILTER in g for g in movie_genres):
+        if not any(genre_filter in g for g in movie_genres):
             return False
-    # Rating filter
+
     rating = details.get("rating")
     if rating is not None:
         try:
-            if float(rating) < MIN_RATING:
+            if float(rating) < min_rating:
                 return False
         except Exception:
             pass
-    elif MIN_RATING > 0:
-        return False  # no rating data — skip if filter is active
-    # Runtime filter
+    elif min_rating > 0:
+        return False
+
     runtime = details.get("runtime")
-    if RUNTIME_FILTER == "short":
-        if runtime is None or runtime >= 60:
+    if runtime_filter == "short":
+        if runtime is None or runtime >= 120:
             return False
-    elif RUNTIME_FILTER == "feature":
+    elif runtime_filter == "feature":
         if runtime is None or runtime < 60:
             return False
+
     return True
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-print(f"🎬 Fetching watchlist for @{USERNAME}...", flush=True)
 
-try:
-    movies = scrape_watchlist(USERNAME)
-except Exception as e:
-    print(json.dumps({"error": f"Could not fetch watchlist. Is the profile public? ({e})"}))
-    sys.exit(1)
+def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any"):
+    username = username.strip().lower().replace("@", "")
+    movies = scrape_watchlist(username)
 
-if not movies:
-    print(json.dumps({"error": f"No movies found in @{USERNAME}'s watchlist. Is the profile public?"}))
-    sys.exit(1)
+    if not movies:
+        raise ValueError(f"No movies found in @{username}'s watchlist. Make sure the profile/watchlist is public.")
 
-print(f"✅ Found {len(movies)} movies in watchlist.", flush=True)
+    random.shuffle(movies)
+    max_attempts = min(30, len(movies))
+    picked = None
+    filters_used = True
 
-# Shuffle and iterate, applying filters
-random.shuffle(movies)
-MAX_ATTEMPTS = min(30, len(movies))
-picked = None
+    for candidate in movies[:max_attempts]:
+        details = get_film_details(candidate["slug"])
+        if passes_filters(details, genre_filter, min_rating, runtime_filter):
+            picked = details
+            break
+        time.sleep(0.3)
 
-print("🔍 Applying filters and picking a movie...", flush=True)
+    if not picked:
+        filters_used = False
+        candidate = random.choice(movies)
+        picked = get_film_details(candidate["slug"])
 
-for candidate in movies[:MAX_ATTEMPTS]:
-    details = get_film_details(candidate["slug"])
-    if passes_filters(details):
-        picked = details
-        break
-    time.sleep(0.3)
+    picked["watchlist_total"] = len(movies)
+    picked["filters_used"] = filters_used
+    return picked
 
-if not picked:
-    # Fallback: ignore filters and pick any random movie
-    print("⚠️  No movies matched your filters; picking any random movie.", flush=True)
-    candidate = random.choice(movies)
-    picked = get_film_details(candidate["slug"])
 
-# ── Output ────────────────────────────────────────────────────────────────────
-result = {
-    "title":           picked.get("title", "Unknown"),
-    "year":            picked.get("year", ""),
-    "director":        picked.get("director", ""),
-    "synopsis":        picked.get("synopsis", "No synopsis available."),
-    "rating":          picked.get("rating"),
-    "runtime":         picked.get("runtime"),
-    "genres":          picked.get("genres", []),
-    "poster":          picked.get("poster", ""),
-    "url":             picked.get("url", ""),
-    "watchlist_total": len(movies),
-    "filters_applied": {
-        "genre":      GENRE_FILTER or "any",
-        "min_rating": MIN_RATING,
-        "runtime":    RUNTIME_FILTER,
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Random Letterboxd Picker</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #f4f4f4;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 30px;
     }
-}
+    .container {
+      width: 100%;
+      max-width: 950px;
+    }
+    .hero {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    h1 {
+      font-size: 42px;
+      margin-bottom: 8px;
+    }
+    p {
+      color: #cfcfcf;
+      line-height: 1.5;
+    }
+    form {
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 18px;
+      padding: 22px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: #aaa;
+      margin-bottom: 6px;
+    }
+    input, select, button {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 10px;
+      border: 1px solid #444;
+      padding: 12px;
+      background: #101010;
+      color: #fff;
+      font-size: 15px;
+    }
+    button {
+      background: #00c030;
+      color: #071107;
+      border: none;
+      cursor: pointer;
+      font-weight: bold;
+      align-self: end;
+    }
+    button:hover {
+      filter: brightness(1.1);
+    }
+    .card {
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 22px;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 0;
+    }
+    .poster {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #333;
+    }
+    .content {
+      padding: 26px;
+    }
+    .title {
+      font-size: 34px;
+      margin: 0 0 8px;
+    }
+    .meta {
+      color: #aaa;
+      margin-bottom: 18px;
+    }
+    .pill {
+      display: inline-block;
+      background: #292929;
+      border: 1px solid #444;
+      padding: 7px 10px;
+      border-radius: 999px;
+      margin: 0 6px 6px 0;
+      font-size: 13px;
+      color: #ddd;
+    }
+    .link {
+      display: inline-block;
+      margin-top: 16px;
+      color: #00e054;
+      text-decoration: none;
+      font-weight: bold;
+    }
+    .error {
+      background: #3b1010;
+      border: 1px solid #7d2b2b;
+      color: #ffd7d7;
+      padding: 18px;
+      border-radius: 14px;
+    }
+    .note {
+      background: #32270f;
+      border: 1px solid #80641e;
+      padding: 12px;
+      border-radius: 12px;
+      color: #ffe7a6;
+      margin-bottom: 14px;
+    }
+    @media (max-width: 800px) {
+      form, .card {
+        grid-template-columns: 1fr;
+      }
+      .poster {
+        max-height: 420px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <section class="hero">
+      <h1>🎬 Random Letterboxd Picker</h1>
+      <p>Enter a public Letterboxd username and let the app pick something from the watchlist.</p>
+    </section>
 
-print("\n[LETTERBOXD_RESULT:" + json.dumps(result) + "]")
+    <form method="POST">
+      <div>
+        <label for="username">Letterboxd username</label>
+        <input id="username" name="username" value="{{ username }}" placeholder="MaxLubelczyk" required>
+      </div>
+      <div>
+        <label for="genre">Genre</label>
+        <input id="genre" name="genre" value="{{ genre }}" placeholder="any, horror, comedy">
+      </div>
+      <div>
+        <label for="min_rating">Minimum rating</label>
+        <input id="min_rating" name="min_rating" value="{{ min_rating }}" placeholder="0" type="number" min="0" max="5" step="0.1">
+      </div>
+      <div>
+        <label for="runtime">Runtime</label>
+        <select id="runtime" name="runtime">
+          <option value="any" {% if runtime == 'any' %}selected{% endif %}>Any</option>
+          <option value="short" {% if runtime == 'short' %}selected{% endif %}>Under 120 min</option>
+          <option value="feature" {% if runtime == 'feature' %}selected{% endif %}>Feature 60+ min</option>
+        </select>
+      </div>
+      <button type="submit">Pick Movie</button>
+    </form>
+
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
+
+    {% if movie %}
+      {% if not movie.filters_used %}
+        <div class="note">No movie matched your filters, so this pick ignores the filters.</div>
+      {% endif %}
+
+      <section class="card">
+        {% if movie.poster %}
+          <img class="poster" src="{{ movie.poster }}" alt="Poster for {{ movie.title }}">
+        {% else %}
+          <div class="poster"></div>
+        {% endif %}
+        <div class="content">
+          <h2 class="title">{{ movie.title }} {% if movie.year %}({{ movie.year }}){% endif %}</h2>
+          <div class="meta">
+            {% if movie.director %}Directed by {{ movie.director }} · {% endif %}
+            {% if movie.runtime %}{{ movie.runtime }} mins · {% endif %}
+            {% if movie.rating %}⭐ {{ movie.rating }}/5{% endif %}
+          </div>
+
+          {% for genre in movie.genres %}
+            <span class="pill">{{ genre }}</span>
+          {% endfor %}
+
+          <p>{{ movie.synopsis }}</p>
+          <p>Picked from {{ movie.watchlist_total }} total watchlist movies.</p>
+          <a class="link" href="{{ movie.url }}" target="_blank">View on Letterboxd →</a>
+        </div>
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    movie = None
+    error = None
+    username = "MaxLubelczyk"
+    genre = "any"
+    min_rating = "0"
+    runtime = "any"
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        genre = request.form.get("genre", "any").strip().lower() or "any"
+        min_rating = request.form.get("min_rating", "0").strip() or "0"
+        runtime = request.form.get("runtime", "any").strip().lower() or "any"
+
+        try:
+            movie = pick_movie(
+                username=username,
+                genre_filter=genre,
+                min_rating=float(min_rating),
+                runtime_filter=runtime,
+            )
+        except Exception as exc:
+            error = str(exc)
+
+    return render_template_string(
+        HTML,
+        movie=movie,
+        error=error,
+        username=username,
+        genre=genre,
+        min_rating=min_rating,
+        runtime=runtime,
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
