@@ -47,6 +47,11 @@ STREAMING_PROVIDER_NAMES = {
     "pluto": ["Pluto TV"],
 }
 
+# Simple in-memory caches make re-rolls much faster while the app is running.
+WATCHLIST_CACHE = {}
+FILM_DETAILS_CACHE = {}
+STREAMING_CACHE = {}
+
 
 def fetch(url, retries=3, headers=None):
     headers = headers or HEADERS
@@ -93,6 +98,9 @@ class WatchlistParser(HTMLParser):
 
 
 def scrape_watchlist(username):
+    if username in WATCHLIST_CACHE:
+        return WATCHLIST_CACHE[username]
+
     base = f"https://letterboxd.com/{username}/watchlist"
     html = fetch(f"{base}/")
     parser = WatchlistParser()
@@ -108,6 +116,7 @@ def scrape_watchlist(username):
             except Exception:
                 pass
 
+    WATCHLIST_CACHE[username] = parser.movies
     return parser.movies
 
 
@@ -145,6 +154,9 @@ class FilmParser(HTMLParser):
 
 
 def get_film_details(slug):
+    if slug in FILM_DETAILS_CACHE:
+        return dict(FILM_DETAILS_CACHE[slug])
+
     url = f"https://letterboxd.com/film/{slug}/"
     html = fetch(url)
     parser = FilmParser()
@@ -206,6 +218,7 @@ def get_film_details(slug):
     if og_img:
         details["poster"] = og_img.group(1)
 
+    FILM_DETAILS_CACHE[slug] = dict(details)
     return details
 
 
@@ -258,8 +271,13 @@ def get_tmdb_movie_id(title, year=""):
 
 
 def get_streaming_providers(title, year="", country="US"):
+    cache_key = (title.lower().strip(), str(year), country.upper())
+    if cache_key in STREAMING_CACHE:
+        return STREAMING_CACHE[cache_key]
+
     movie_id = get_tmdb_movie_id(title, year)
     if not movie_id:
+        STREAMING_CACHE[cache_key] = []
         return []
 
     url = f"https://api.themoviedb.org/3/movie/{movie_id}/watch/providers"
@@ -275,6 +293,7 @@ def get_streaming_providers(title, year="", country="US"):
             if name and name not in providers:
                 providers.append(name)
 
+    STREAMING_CACHE[cache_key] = providers
     return providers
 
 
@@ -334,7 +353,9 @@ def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any",
         raise ValueError(f"No movies found in @{username}'s watchlist. Make sure the profile/watchlist is public.")
 
     random.shuffle(movies)
-    max_attempts = min(40, len(movies))
+    # Higher attempts = better matching, but slower.
+    # 20 is a good balance for local testing.
+    max_attempts = min(20, len(movies))
     picked = None
     filters_used = True
 
@@ -343,7 +364,6 @@ def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any",
         if passes_filters(details, genre_filter, min_rating, runtime_filter, streaming_filter):
             picked = details
             break
-        time.sleep(0.3)
 
     if not picked:
         filters_used = False
@@ -766,5 +786,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
