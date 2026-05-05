@@ -22,7 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
 
@@ -561,13 +561,14 @@ HTML = """
           <option value="pluto" {% if streaming == 'pluto' %}selected{% endif %}>Pluto TV</option>
         </select>
       </div>
-      <button type="submit">Pick Movie</button>
+      <button type="submit" id="pickButton">Pick Movie</button>
     </form>
 
     {% if error %}
       <div class="error">{{ error }}</div>
     {% endif %}
 
+    <div id="resultArea">
     {% if movie %}
       {% if not movie.filters_used %}
         <div class="note">No movie matched every filter, so this pick ignores one or more filters.</div>
@@ -606,20 +607,121 @@ HTML = """
         </div>
       </section>
     {% endif %}
+    </div>
   </main>
 
   <script>
     const form = document.querySelector("form");
-    const button = document.querySelector("button");
+    const button = document.querySelector("#pickButton");
+    const resultArea = document.querySelector("#resultArea");
 
-    form.addEventListener("submit", () => {
+    function escapeHtml(value) {
+      if (value === null || value === undefined) return "";
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function movieCardHtml(movie) {
+      const genres = (movie.genres || [])
+        .map(genre => `<span class="pill">${escapeHtml(genre)}</span>`)
+        .join("");
+
+      const streaming = (movie.streaming_providers || [])
+        .map(provider => `<span class="pill streaming-pill">${escapeHtml(provider)}</span>`)
+        .join("");
+
+      const streamingBlock = streaming
+        ? `<p><strong>Available on:</strong></p>${streaming}`
+        : "";
+
+      const note = movie.filters_used
+        ? ""
+        : `<div class="note">No movie matched every filter, so this pick ignores one or more filters.</div>`;
+
+      return `
+        ${note}
+        <section class="card">
+          ${movie.poster
+            ? `<img class="poster" src="${escapeHtml(movie.poster)}" alt="Poster for ${escapeHtml(movie.title)}">`
+            : `<div class="poster"></div>`
+          }
+          <div class="content">
+            <h2 class="title">${escapeHtml(movie.title)} ${movie.year ? `(${escapeHtml(movie.year)})` : ""}</h2>
+            <div class="meta">
+              ${movie.director ? `Directed by ${escapeHtml(movie.director)} · ` : ""}
+              ${movie.runtime ? `${escapeHtml(movie.runtime)} mins · ` : ""}
+              ${movie.rating ? `⭐ ${escapeHtml(movie.rating)}/5` : ""}
+            </div>
+
+            ${genres}
+            ${streamingBlock}
+
+            <p>${escapeHtml(movie.synopsis)}</p>
+            <p>Picked from ${escapeHtml(movie.watchlist_total)} total watchlist movies.</p>
+            <a class="link" href="${escapeHtml(movie.url)}" target="_blank">View on Letterboxd →</a>
+          </div>
+        </section>
+      `;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
       button.textContent = "Picking...";
       button.disabled = true;
+      resultArea.innerHTML = `<div class="note">Picking a movie from your watchlist...</div>`;
+
+      try {
+        const response = await fetch("/api/pick", {
+          method: "POST",
+          body: new FormData(form),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+          resultArea.innerHTML = `<div class="error">${escapeHtml(data.error || "Something went wrong.")}</div>`;
+        } else {
+          resultArea.innerHTML = movieCardHtml(data.movie);
+          button.textContent = "Re-roll";
+        }
+      } catch (error) {
+        resultArea.innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+
+      button.disabled = false;
+      if (button.textContent !== "Re-roll") {
+        button.textContent = "Pick Movie";
+      }
     });
   </script>
 </body>
 </html>
 """
+
+
+@app.route("/api/pick", methods=["POST"])
+def api_pick():
+    username = request.form.get("username", "").strip()
+    genre = request.form.get("genre", "any").strip().lower() or "any"
+    min_rating = request.form.get("min_rating", "0").strip() or "0"
+    runtime = request.form.get("runtime", "any").strip().lower() or "any"
+    streaming = request.form.get("streaming", "any").strip().lower() or "any"
+
+    try:
+        movie = pick_movie(
+            username=username,
+            genre_filter=genre,
+            min_rating=float(min_rating),
+            runtime_filter=runtime,
+            streaming_filter=streaming,
+        )
+        return jsonify({"movie": movie})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -664,4 +766,5 @@ def index():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
