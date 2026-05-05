@@ -695,7 +695,7 @@ HTML = """
       resultArea.innerHTML = `<div class="note">Picking a movie from your watchlist...</div>`;
 
       try {
-        const response = await fetch("/api/pick", {
+        const response = await fetch(`${window.location.origin}/api/pick`, {
           method: "POST",
           body: new FormData(form),
         });
