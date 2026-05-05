@@ -5,17 +5,21 @@ Letterboxd Watchlist Random Movie Picker - Web App Version
 How to run:
 1. Save this file as app.py
 2. Install Flask:
-   pip install flask
-3. Run:
-   python app.py
-4. Open your browser to:
+   py -m pip install flask
+3. Optional for streaming-provider filtering:
+   Set a TMDB API key as an environment variable named TMDB_API_KEY
+4. Run:
+   py app.py
+5. Open your browser to:
    http://127.0.0.1:5000
 """
 
 import json
+import os
 import random
 import re
 import time
+import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from flask import Flask, request, render_template_string
@@ -31,11 +35,24 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Streaming provider names as TMDb commonly returns them.
+# The code checks names instead of hard-coding provider IDs, which is easier to maintain.
+STREAMING_PROVIDER_NAMES = {
+    "any": [],
+    "netflix": ["Netflix"],
+    "max": ["Max", "HBO Max"],
+    "hulu": ["Hulu"],
+    "paramount": ["Paramount Plus", "Paramount+", "Paramount+ with Showtime"],
+    "tubi": ["Tubi TV", "Tubi"],
+    "pluto": ["Pluto TV"],
+}
 
-def fetch(url, retries=3):
+
+def fetch(url, retries=3, headers=None):
+    headers = headers or HEADERS
     for i in range(retries):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as r:
                 return r.read().decode("utf-8", errors="replace")
         except Exception:
@@ -144,6 +161,8 @@ def get_film_details(slug):
         "poster": "",
         "director": "",
         "title": slug.replace("-", " ").title(),
+        "streaming_providers": [],
+        "tmdb_match_found": False,
     }
 
     if parser.json_ld:
@@ -190,7 +209,94 @@ def get_film_details(slug):
     return details
 
 
-def passes_filters(details, genre_filter, min_rating, runtime_filter):
+def tmdb_request(url):
+    """Request TMDb using either a v3 API key or a v4 bearer token."""
+    tmdb_api_key = os.environ.get("TMDB_API_KEY", "").strip()
+    tmdb_bearer_token = os.environ.get("TMDB_BEARER_TOKEN", "").strip()
+
+    if tmdb_bearer_token:
+        headers = dict(HEADERS)
+        headers["Authorization"] = f"Bearer {tmdb_bearer_token}"
+        return json.loads(fetch(url, headers=headers))
+
+    if tmdb_api_key:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}api_key={urllib.parse.quote(tmdb_api_key)}"
+        return json.loads(fetch(url))
+
+    raise ValueError(
+        "Streaming-platform filtering needs a TMDb API key. "
+        "For now, choose Streaming Platform = Any, or add TMDB_API_KEY on your computer."
+    )
+
+
+def get_tmdb_movie_id(title, year=""):
+    params = {
+        "query": title,
+        "include_adult": "false",
+        "language": "en-US",
+        "page": "1",
+    }
+    if year:
+        params["year"] = str(year)
+
+    url = "https://api.themoviedb.org/3/search/movie?" + urllib.parse.urlencode(params)
+    data = tmdb_request(url)
+    results = data.get("results", [])
+
+    if not results and year:
+        # Retry without year if the year match fails.
+        params.pop("year", None)
+        url = "https://api.themoviedb.org/3/search/movie?" + urllib.parse.urlencode(params)
+        data = tmdb_request(url)
+        results = data.get("results", [])
+
+    if not results:
+        return None
+
+    return results[0].get("id")
+
+
+def get_streaming_providers(title, year="", country="US"):
+    movie_id = get_tmdb_movie_id(title, year)
+    if not movie_id:
+        return []
+
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}/watch/providers"
+    data = tmdb_request(url)
+    country_data = data.get("results", {}).get(country.upper(), {})
+
+    provider_sections = ["flatrate", "free", "ads"]
+    providers = []
+
+    for section in provider_sections:
+        for provider in country_data.get(section, []):
+            name = provider.get("provider_name")
+            if name and name not in providers:
+                providers.append(name)
+
+    return providers
+
+
+def streaming_provider_matches(details, streaming_filter):
+    if not streaming_filter or streaming_filter == "any":
+        return True
+
+    wanted_names = STREAMING_PROVIDER_NAMES.get(streaming_filter, [])
+    if not wanted_names:
+        return True
+
+    providers = get_streaming_providers(details.get("title", ""), details.get("year", ""))
+    details["streaming_providers"] = providers
+    details["tmdb_match_found"] = bool(providers)
+
+    provider_names_lower = [p.lower() for p in providers]
+    wanted_names_lower = [w.lower() for w in wanted_names]
+
+    return any(wanted in provider for wanted in wanted_names_lower for provider in provider_names_lower)
+
+
+def passes_filters(details, genre_filter, min_rating, runtime_filter, streaming_filter):
     if genre_filter and genre_filter != "any":
         movie_genres = [g.lower() for g in details.get("genres", [])]
         if not any(genre_filter in g for g in movie_genres):
@@ -207,17 +313,20 @@ def passes_filters(details, genre_filter, min_rating, runtime_filter):
         return False
 
     runtime = details.get("runtime")
-    if runtime_filter == "short":
-        if runtime is None or runtime >= 60:
+    if runtime_filter == "under120":
+        if runtime is None or runtime >= 120:
             return False
     elif runtime_filter == "feature":
         if runtime is None or runtime < 60:
             return False
 
+    if not streaming_provider_matches(details, streaming_filter):
+        return False
+
     return True
 
 
-def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any"):
+def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any", streaming_filter="any"):
     username = username.strip().lower().replace("@", "")
     movies = scrape_watchlist(username)
 
@@ -225,13 +334,13 @@ def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any")
         raise ValueError(f"No movies found in @{username}'s watchlist. Make sure the profile/watchlist is public.")
 
     random.shuffle(movies)
-    max_attempts = min(30, len(movies))
+    max_attempts = min(40, len(movies))
     picked = None
     filters_used = True
 
     for candidate in movies[:max_attempts]:
         details = get_film_details(candidate["slug"])
-        if passes_filters(details, genre_filter, min_rating, runtime_filter):
+        if passes_filters(details, genre_filter, min_rating, runtime_filter, streaming_filter):
             picked = details
             break
         time.sleep(0.3)
@@ -240,6 +349,11 @@ def pick_movie(username, genre_filter="any", min_rating=0, runtime_filter="any")
         filters_used = False
         candidate = random.choice(movies)
         picked = get_film_details(candidate["slug"])
+        if streaming_filter and streaming_filter != "any":
+            try:
+                picked["streaming_providers"] = get_streaming_providers(picked.get("title", ""), picked.get("year", ""))
+            except Exception:
+                picked["streaming_providers"] = []
 
     picked["watchlist_total"] = len(movies)
     picked["filters_used"] = filters_used
@@ -267,7 +381,7 @@ HTML = """
     }
     .container {
       width: 100%;
-      max-width: 950px;
+      max-width: 1100px;
     }
     .hero {
       text-align: center;
@@ -287,7 +401,7 @@ HTML = """
       border-radius: 18px;
       padding: 22px;
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       gap: 14px;
       margin-bottom: 24px;
     }
@@ -317,6 +431,10 @@ HTML = """
     }
     button:hover {
       filter: brightness(1.1);
+    }
+    button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
     }
     .card {
       background: #1c1c1c;
@@ -354,6 +472,11 @@ HTML = """
       font-size: 13px;
       color: #ddd;
     }
+    .streaming-pill {
+      background: #15351d;
+      border-color: #00c030;
+      color: #d8ffe0;
+    }
     .link {
       display: inline-block;
       margin-top: 16px;
@@ -367,6 +490,7 @@ HTML = """
       color: #ffd7d7;
       padding: 18px;
       border-radius: 14px;
+      margin-bottom: 16px;
     }
     .note {
       background: #32270f;
@@ -375,6 +499,17 @@ HTML = """
       border-radius: 12px;
       color: #ffe7a6;
       margin-bottom: 14px;
+    }
+    .wide {
+      grid-column: span 2;
+    }
+    @media (max-width: 1000px) {
+      form {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .wide {
+        grid-column: span 1;
+      }
     }
     @media (max-width: 800px) {
       form, .card {
@@ -410,8 +545,20 @@ HTML = """
         <label for="runtime">Runtime</label>
         <select id="runtime" name="runtime">
           <option value="any" {% if runtime == 'any' %}selected{% endif %}>Any</option>
-          <option value="short" {% if runtime == 'short' %}selected{% endif %}>Short &lt; 60 min</option>
+          <option value="under120" {% if runtime == 'under120' %}selected{% endif %}>Under 120 min</option>
           <option value="feature" {% if runtime == 'feature' %}selected{% endif %}>Feature 60+ min</option>
+        </select>
+      </div>
+      <div class="wide">
+        <label for="streaming">Streaming Platform</label>
+        <select id="streaming" name="streaming">
+          <option value="any" {% if streaming == 'any' %}selected{% endif %}>Any / No streaming filter</option>
+          <option value="netflix" {% if streaming == 'netflix' %}selected{% endif %}>Netflix</option>
+          <option value="max" {% if streaming == 'max' %}selected{% endif %}>Max / HBO Max</option>
+          <option value="hulu" {% if streaming == 'hulu' %}selected{% endif %}>Hulu</option>
+          <option value="paramount" {% if streaming == 'paramount' %}selected{% endif %}>Paramount+</option>
+          <option value="tubi" {% if streaming == 'tubi' %}selected{% endif %}>Tubi</option>
+          <option value="pluto" {% if streaming == 'pluto' %}selected{% endif %}>Pluto TV</option>
         </select>
       </div>
       <button type="submit">Pick Movie</button>
@@ -423,7 +570,7 @@ HTML = """
 
     {% if movie %}
       {% if not movie.filters_used %}
-        <div class="note">No movie matched your filters, so this pick ignores the filters.</div>
+        <div class="note">No movie matched every filter, so this pick ignores one or more filters.</div>
       {% endif %}
 
       <section class="card">
@@ -444,6 +591,15 @@ HTML = """
             <span class="pill">{{ genre }}</span>
           {% endfor %}
 
+          {% if movie.streaming_providers %}
+            <p><strong>Available on:</strong></p>
+            {% for provider in movie.streaming_providers %}
+              <span class="pill streaming-pill">{{ provider }}</span>
+            {% endfor %}
+          {% elif streaming != 'any' %}
+            <p><strong>Streaming:</strong> No provider match found through TMDb for this pick.</p>
+          {% endif %}
+
           <p>{{ movie.synopsis }}</p>
           <p>Picked from {{ movie.watchlist_total }} total watchlist movies.</p>
           <a class="link" href="{{ movie.url }}" target="_blank">View on Letterboxd →</a>
@@ -451,6 +607,16 @@ HTML = """
       </section>
     {% endif %}
   </main>
+
+  <script>
+    const form = document.querySelector("form");
+    const button = document.querySelector("button");
+
+    form.addEventListener("submit", () => {
+      button.textContent = "Picking...";
+      button.disabled = true;
+    });
+  </script>
 </body>
 </html>
 """
@@ -464,12 +630,14 @@ def index():
     genre = "any"
     min_rating = "0"
     runtime = "any"
+    streaming = "any"
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         genre = request.form.get("genre", "any").strip().lower() or "any"
         min_rating = request.form.get("min_rating", "0").strip() or "0"
         runtime = request.form.get("runtime", "any").strip().lower() or "any"
+        streaming = request.form.get("streaming", "any").strip().lower() or "any"
 
         try:
             movie = pick_movie(
@@ -477,6 +645,7 @@ def index():
                 genre_filter=genre,
                 min_rating=float(min_rating),
                 runtime_filter=runtime,
+                streaming_filter=streaming,
             )
         except Exception as exc:
             error = str(exc)
@@ -489,8 +658,10 @@ def index():
         genre=genre,
         min_rating=min_rating,
         runtime=runtime,
+        streaming=streaming,
     )
 
 
 if __name__ == "__main__":
     app.run(debug=True)
+
